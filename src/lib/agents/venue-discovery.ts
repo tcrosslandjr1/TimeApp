@@ -574,6 +574,33 @@ export async function discoverTripCorridorVenues(params: TripCorridorParams): Pr
 }
 
 /**
+ * Forward-geocode a city name to lat/lng using Nominatim (OSM).
+ * Returns undefined if the city cannot be resolved.
+ */
+export async function geocodeCity(cityName: string): Promise<GeoLocation | undefined> {
+  try {
+    const q = encodeURIComponent(cityName);
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/search?q=${q}&format=jsonv2&limit=1&addressdetails=1`,
+      { headers: { "User-Agent": "Confetti App" } }
+    );
+    if (!res.ok) return undefined;
+    const results = await res.json();
+    if (!results.length) return undefined;
+    const top = results[0];
+    return {
+      lat: parseFloat(top.lat),
+      lng: parseFloat(top.lon),
+      city: top.address?.city ?? top.address?.town ?? top.name ?? cityName,
+      state: top.address?.state,
+      country: top.address?.country_code?.toUpperCase() ?? "US",
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Get the user's current location (browser geolocation API).
  */
 export function getUserLocation(): Promise<GeoLocation> {
