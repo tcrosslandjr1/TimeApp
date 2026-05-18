@@ -189,6 +189,17 @@ export type {
   FundDashboard,
 } from "./wallet-pass";
 
+// ─── Interaction Tracker (Implicit Learning) ─────────────────
+export {
+  trackInteraction,
+  startViewTimer,
+  trackImplicitSkips,
+} from "./interaction-tracker";
+export type {
+  InteractionEvent,
+  TrackInteractionParams,
+} from "./interaction-tracker";
+
 // ─── Community Agent ─────────────────────────────────────────
 export {
   sharePlan,

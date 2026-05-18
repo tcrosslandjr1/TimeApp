@@ -148,7 +148,7 @@ create table if not exists public.group_invites (
   id uuid primary key default gen_random_uuid(),
   itinerary_id uuid not null references public.itineraries(id) on delete cascade,
   owner_id uuid not null references public.profiles(id) on delete cascade,
-  invite_token text not null unique default encode(gen_random_bytes(18), 'hex'),
+  invite_token text not null unique default encode(extensions.gen_random_bytes(18), 'hex'),
   expires_at timestamptz,
   created_at timestamptz not null default now()
 );

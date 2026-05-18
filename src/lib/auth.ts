@@ -1,0 +1,277 @@
+import type { Provider, User } from "@supabase/supabase-js";
+import { isSupabaseConfigured, supabase } from "./supabase";
+
+export { isSupabaseConfigured };
+
+export type AuthProviderId = "google" | "apple";
+
+export type AccountPayload = {
+  fullName: string;
+  username: string;
+  email: string;
+  password: string;
+};
+
+export type AuthAccount = {
+  id: string;
+  email: string;
+  fullName: string;
+  username: string;
+  provider: "email" | AuthProviderId;
+};
+
+const demoAccountKey = "confetti-demo-account";
+const usernamePattern = /^[A-Za-z0-9_]{3,24}$/;
+
+export function normalizeUsername(value: string) {
+  return value.trim().replace(/\s+/g, "_").replace(/[^\w]/g, "").slice(0, 24);
+}
+
+function redirectUrl() {
+  return typeof window === "undefined" ? undefined : `${window.location.origin}/auth/callback`;
+}
+
+function readDemoAccount(): AuthAccount | null {
+  if (typeof localStorage === "undefined") return null;
+  const raw = localStorage.getItem(demoAccountKey);
+  if (!raw) return null;
+
+  try {
+    return JSON.parse(raw) as AuthAccount;
+  } catch {
+    return null;
+  }
+}
+
+function saveDemoAccount(account: AuthAccount) {
+  if (typeof localStorage !== "undefined") {
+    localStorage.setItem(demoAccountKey, JSON.stringify(account));
+  }
+}
+
+function mapSupabaseUser(user: User, provider: AuthAccount["provider"] = "email"): AuthAccount {
+  const metadata = user.user_metadata ?? {};
+  return {
+    id: user.id,
+    email: user.email ?? "",
+    fullName: metadata.full_name ?? metadata.name ?? "Confetti Member",
+    username: metadata.username ?? normalizeUsername(user.email?.split("@")[0] ?? "confetti_member"),
+    provider
+  };
+}
+
+function getAuthProvider(user: User): AuthAccount["provider"] {
+  const provider = user.app_metadata?.provider;
+  return provider === "google" || provider === "apple" ? provider : "email";
+}
+
+async function syncProfile(user: User) {
+  const provider = getAuthProvider(user);
+  const account = mapSupabaseUser(user, provider);
+
+  const { error: profileError } = await supabase.from("profiles").upsert({
+    id: user.id,
+    full_name: account.fullName,
+    username: account.username,
+    email: account.email,
+    avatar_url: user.user_metadata?.avatar_url ?? user.user_metadata?.picture ?? null,
+    auth_provider: provider,
+    last_login_at: new Date().toISOString()
+  });
+
+  if (profileError) throw profileError;
+
+  if (provider === "google" || provider === "apple") {
+    const identity = user.identities?.find((item) => item.provider === provider);
+    const identityData = identity?.identity_data as Record<string, unknown> | undefined;
+
+    const { error: linkError } = await supabase.from("profile_social_links").upsert({
+      user_id: user.id,
+      provider,
+      provider_user_id: identity?.id ?? null,
+      provider_email: typeof identityData?.email === "string" ? identityData.email : account.email,
+      last_used_at: new Date().toISOString(),
+      metadata: {
+        name: identityData?.name ?? user.user_metadata?.name ?? null,
+        avatar_url: identityData?.avatar_url ?? user.user_metadata?.avatar_url ?? user.user_metadata?.picture ?? null
+      }
+    });
+
+    if (linkError) throw linkError;
+  }
+
+  return account;
+}
+
+function validateAccount(payload: AccountPayload) {
+  const username = normalizeUsername(payload.username);
+
+  if (!usernamePattern.test(username)) {
+    throw new Error("Username must be 3-24 characters using letters, numbers, or underscores.");
+  }
+
+  if (!payload.email.includes("@")) {
+    throw new Error("Enter a valid email address.");
+  }
+
+  if (payload.password.length < 8) {
+    throw new Error("Password must be at least 8 characters.");
+  }
+
+  return { ...payload, username, email: payload.email.trim().toLowerCase() };
+}
+
+export async function createAccountWithEmail(payload: AccountPayload) {
+  const clean = validateAccount(payload);
+  const fullName = clean.fullName.trim() || clean.username;
+
+  if (!isSupabaseConfigured) {
+    const account: AuthAccount = {
+      id: `demo-${Date.now()}`,
+      email: clean.email,
+      fullName,
+      username: clean.username,
+      provider: "email"
+    };
+    saveDemoAccount(account);
+    return { account, needsEmailConfirmation: false };
+  }
+
+  const { data, error } = await supabase.auth.signUp({
+    email: clean.email,
+    password: clean.password,
+    options: {
+      data: {
+        full_name: fullName,
+        username: clean.username
+      },
+      emailRedirectTo: redirectUrl()
+    }
+  });
+
+  if (error) throw error;
+  if (!data.user) throw new Error("Account creation did not return a user.");
+
+  const { error: profileError } = await supabase.from("profiles").upsert({
+    id: data.user.id,
+    full_name: fullName,
+    username: clean.username,
+    email: clean.email,
+    auth_provider: "email",
+    last_login_at: new Date().toISOString()
+  });
+
+  if (profileError) throw profileError;
+
+  return {
+    account: mapSupabaseUser(data.user),
+    needsEmailConfirmation: Boolean(!data.session)
+  };
+}
+
+async function resolveLoginIdentifier(identifier: string) {
+  const clean = identifier.trim().toLowerCase();
+  if (clean.includes("@") || !isSupabaseConfigured) return clean;
+
+  const { data, error } = await supabase.rpc("resolve_login_identifier", {
+    login_identifier: normalizeUsername(clean)
+  });
+
+  if (error) throw error;
+  if (!data) throw new Error("That username was not found. Try your email address.");
+  return String(data);
+}
+
+export async function signInWithEmailOrUsername(identifier: string, password: string) {
+  if (!password) throw new Error("Enter your password.");
+
+  if (!isSupabaseConfigured) {
+    const saved = readDemoAccount();
+    if (saved) return saved;
+    const username = normalizeUsername(identifier.includes("@") ? identifier.split("@")[0] : identifier);
+    const account: AuthAccount = {
+      id: "demo-user",
+      email: identifier.includes("@") ? identifier : `${username || "demo"}@confetti.local`,
+      fullName: "Demo Explorer",
+      username: username || "demo_explorer",
+      provider: "email"
+    };
+    saveDemoAccount(account);
+    return account;
+  }
+
+  const email = await resolveLoginIdentifier(identifier);
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) throw error;
+  if (!data.user) throw new Error("Sign in did not return a user.");
+
+  await supabase
+    .from("profiles")
+    .update({ last_login_at: new Date().toISOString(), auth_provider: "email" })
+    .eq("id", data.user.id);
+
+  return mapSupabaseUser(data.user);
+}
+
+export async function signInWithSocial(provider: AuthProviderId) {
+  if (!isSupabaseConfigured) {
+    const account: AuthAccount = {
+      id: `demo-${provider}`,
+      email: `${provider}@confetti.local`,
+      fullName: `${provider === "google" ? "Google" : "Apple"} Demo`,
+      username: `${provider}_demo`,
+      provider
+    };
+    saveDemoAccount(account);
+    return { account, redirecting: false };
+  }
+
+  const { data, error } = await supabase.auth.signInWithOAuth({
+    provider: provider as Provider,
+    options: {
+      redirectTo: redirectUrl(),
+      queryParams: provider === "google" ? { access_type: "offline", prompt: "consent" } : undefined
+    }
+  });
+
+  if (error) throw error;
+  return { url: data.url, redirecting: true };
+}
+
+export async function getCurrentAccount() {
+  if (!isSupabaseConfigured) return readDemoAccount();
+
+  const { data, error } = await supabase.auth.getSession();
+  if (error || !data.session?.user) return null;
+  return mapSupabaseUser(data.session.user);
+}
+
+export async function completeAuthCallback() {
+  if (!isSupabaseConfigured) return readDemoAccount();
+
+  if (typeof window !== "undefined") {
+    const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+    const queryParams = new URLSearchParams(window.location.search);
+    const authError = hashParams.get("error_description") ?? queryParams.get("error_description");
+    if (authError) throw new Error(authError);
+
+    const code = queryParams.get("code");
+    if (code) {
+      const { error } = await supabase.auth.exchangeCodeForSession(code);
+      if (error) throw error;
+    }
+  }
+
+  const { data, error } = await supabase.auth.getSession();
+  if (error) throw error;
+  if (!data.session?.user) throw new Error("No Supabase session was found after the callback.");
+
+  return syncProfile(data.session.user);
+}
+
+export async function signOutAccount() {
+  if (typeof localStorage !== "undefined") {
+    localStorage.removeItem(demoAccountKey);
+  }
+  await supabase.auth.signOut({ scope: "local" });
+}

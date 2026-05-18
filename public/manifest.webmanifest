@@ -1,7 +1,7 @@
 {
-  "name": "AI Lifestyle Concierge",
-  "short_name": "AI Concierge",
-  "description": "AI-powered dining, nightlife, and curated experience planning.",
+  "name": "Confetti",
+  "short_name": "Confetti",
+  "description": "Confetti — AI-powered dining, nightlife, and curated experience planning.",
   "display": "standalone",
   "orientation": "portrait",
   "start_url": "/",

@@ -6,9 +6,15 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
-    "preview": "vite preview --host 127.0.0.1"
+    "preview": "vite preview --host 127.0.0.1",
+    "find:venues": "node scripts/find-top-venues.mjs",
+    "fetch:places": "node scripts/fetch-place-intelligence.mjs",
+    "supabase:setup": "node scripts/setup-confetti-supabase.mjs",
+    "supabase:verify": "node scripts/verify-confetti-supabase.mjs",
+    "supabase:find-confetti": "node scripts/verify-confetti-supabase.mjs --find-confetti"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.90.1",
     "@tanstack/react-query": "^5.83.0",
     "@vitejs/plugin-react-swc": "^3.11.0",
     "framer-motion": "^12.27.1",

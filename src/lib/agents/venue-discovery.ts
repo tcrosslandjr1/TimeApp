@@ -486,19 +486,173 @@ function generateWaypoints(origin: GeoLocation, destination: GeoLocation, interv
   return waypoints;
 }
 
+// ─── Cache-first venue query (reads from venue_cache) ──────
+
+/**
+ * Query venue_cache in Supabase for venues matching the search params.
+ * Returns cached venues if available; empty array if none found.
+ */
+async function queryVenueCache(
+  params: VenueSearchParams,
+  supabaseUrl: string,
+  supabaseAnonKey: string
+): Promise<DiscoveredVenue[]> {
+  const city = params.location.city;
+  if (!city) return [];
+
+  // Build the query body for venue-service/search
+  const searchBody: Record<string, unknown> = {
+    city,
+    limit: params.limit ?? 30,
+  };
+  if (params.query) searchBody.q = params.query;
+  if (params.priceLevel) {
+    const priceMap: Record<string, string[]> = {
+      "$": ["$"], "$$": ["$$"], "$$$": ["$$$"], "$$$$": ["$$$$"],
+    };
+    searchBody.price_tiers = priceMap[params.priceLevel] ?? ["$$"];
+  }
+
+  try {
+    const res = await fetch(`${supabaseUrl}/rest/v1/venue_cache?city=ilike.%25${encodeURIComponent(city)}%25&expires_at=gte.${new Date().toISOString()}&limit=${params.limit ?? 30}&order=rating.desc.nullslast`, {
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${supabaseAnonKey}`,
+        apikey: supabaseAnonKey,
+      },
+    });
+
+    if (!res.ok) return [];
+    const rows = await res.json();
+
+    if (!Array.isArray(rows) || rows.length === 0) return [];
+
+    return rows.map((row: Record<string, unknown>): DiscoveredVenue => ({
+      id: `vc_${row.id}`,
+      name: (row.name as string) ?? "",
+      category: (row.category as string) ?? "Venue",
+      subcategory: row.subcategory as string | undefined,
+      address: (row.address as string) ?? "",
+      city: (row.city as string) ?? "",
+      state: row.state as string | undefined,
+      country: (row.country as string) ?? "US",
+      lat: Number(row.latitude) || 0,
+      lng: Number(row.longitude) || 0,
+      priceLevel: (row.price_level as string) ?? "$$",
+      rating: row.rating as number | undefined,
+      ratingCount: row.rating_count as number | undefined,
+      phone: row.phone as string | undefined,
+      website: row.website as string | undefined,
+      photoUrls: ((row.photo_urls as string[]) ?? []).map(
+        (p) => `${supabaseUrl}/functions/v1/places-photo?path=${encodeURIComponent(p)}&w=600`
+      ),
+      cuisineTags: (row.cuisine_tags as string[]) ?? [],
+      vibeTags: (row.vibe_tags as string[]) ?? [],
+      occasionTags: (row.occasion_tags as string[]) ?? [],
+      source: (row.source as "google" | "foursquare") ?? "google",
+      googlePlaceId: row.google_place_id as string | undefined,
+      foursquareId: row.foursquare_id as string | undefined,
+    }));
+  } catch (err) {
+    console.warn("[Confetti] venue_cache query failed:", err);
+    return [];
+  }
+}
+
+/**
+ * Trigger venue-ingest to populate venue_cache for a city.
+ * Runs in the background — returns immediately.
+ */
+async function triggerIngest(
+  city: string,
+  lat: number,
+  lng: number,
+  state: string | undefined,
+  supabaseUrl: string,
+  supabaseAnonKey: string
+): Promise<void> {
+  try {
+    await fetch(`${supabaseUrl}/functions/v1/venue-ingest`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${supabaseAnonKey}`,
+        apikey: supabaseAnonKey,
+      },
+      body: JSON.stringify({ city, lat, lng, state }),
+    });
+  } catch (err) {
+    console.warn("[Confetti] venue-ingest trigger failed:", err);
+  }
+}
+
 // ─── Public API ─────────────────────────────────────────────
 
 /**
- * Search for venues near a location using all available providers.
+ * Search for venues near a location.
+ *
+ * Strategy (cache-first):
+ *   1. Query venue_cache in Supabase for fresh cached venues
+ *   2. If cache has results → return them (zero API cost)
+ *   3. If cache is empty → trigger venue-ingest to populate,
+ *      then fall back to live Google Places while cache builds
+ *   4. If everything fails → return mock venues
+ *
+ * This means Google Places is only called when a city is seen
+ * for the first time. Every subsequent request is free.
  */
 export async function discoverVenues(params: VenueSearchParams): Promise<DiscoveredVenue[]> {
   const config = getConfig();
-  const hasGoogle = Boolean(config.supabaseUrl && config.supabaseAnonKey);
-  const hasFoursquare = Boolean(config.foursquareKey);
+  const hasSupabase = Boolean(config.supabaseUrl && config.supabaseAnonKey);
 
-  if (!hasGoogle && !hasFoursquare) {
+  if (!hasSupabase) {
     return getMockVenues(params);
   }
+
+  // ── Step 1: Try cache first ────────────────────────────
+  const cached = await queryVenueCache(
+    params,
+    config.supabaseUrl!,
+    config.supabaseAnonKey!
+  );
+
+  if (cached.length > 0) {
+    console.log(`[Confetti] Serving ${cached.length} venues from cache for ${params.location.city}`);
+
+    // Filter by query if provided
+    let results = cached;
+    if (params.query) {
+      const q = params.query.toLowerCase();
+      results = cached.filter((v) =>
+        v.name.toLowerCase().includes(q) ||
+        v.cuisineTags.some((t) => t.toLowerCase().includes(q)) ||
+        v.vibeTags.some((t) => t.toLowerCase().includes(q)) ||
+        v.category.toLowerCase().includes(q)
+      );
+      // If filter narrows too much, return all cached
+      if (results.length < 3) results = cached;
+    }
+
+    return results.map((v) => ({
+      ...v,
+      distanceMiles: calculateDistance(params.location.lat, params.location.lng, v.lat, v.lng),
+    })).sort((a, b) => (b.matchScore ?? b.rating ?? 0) - (a.matchScore ?? a.rating ?? 0));
+  }
+
+  // ── Step 2: Cache miss — trigger ingest in background ──
+  console.log(`[Confetti] Cache miss for ${params.location.city} — triggering ingest`);
+  triggerIngest(
+    params.location.city ?? "Unknown",
+    params.location.lat,
+    params.location.lng,
+    params.location.state,
+    config.supabaseUrl!,
+    config.supabaseAnonKey!
+  );
+
+  // ── Step 3: Meanwhile, do a live search for immediate results
+  const hasGoogle = Boolean(config.supabaseUrl && config.supabaseAnonKey);
+  const hasFoursquare = Boolean(config.foursquareKey);
 
   const results = await Promise.allSettled([
     hasGoogle
@@ -512,16 +666,14 @@ export async function discoverVenues(params: VenueSearchParams): Promise<Discove
     if (result.status === "fulfilled") venues.push(...result.value);
   }
 
-  // Deduplicate venues from both sources
   const deduped = deduplicateVenues(venues);
 
-  // If APIs returned nothing, fall back to curated picks so the user always sees results
+  // ── Step 4: Last resort — mock venues ──────────────────
   if (deduped.length === 0) {
-    console.warn("[Confetti] APIs returned 0 venues — falling back to curated picks");
+    console.warn("[Confetti] All sources returned 0 venues — falling back to curated picks");
     return getMockVenues(params);
   }
 
-  // Add distance from search center
   return deduped.map((v) => ({
     ...v,
     distanceMiles: calculateDistance(params.location.lat, params.location.lng, v.lat, v.lng),

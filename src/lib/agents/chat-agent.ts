@@ -29,6 +29,7 @@ import {
 import type { DiscoveredVenue, GeoLocation } from "./venue-discovery";
 import { buildItinerary, parseItineraryRequest } from "./itinerary-orchestrator";
 import type { OrchestratorResult } from "./itinerary-orchestrator";
+import { trackInteraction } from "./interaction-tracker";
 import { supabase } from "../supabase";
 
 // ─── Types ─────────────────────────────────────────────────────
@@ -218,11 +219,17 @@ export async function sendMessage(
     userContext = getUserContextLocal();
   }
 
-  // Track the chat query
+  // Track the chat query (dual-track: legacy + new interaction tracker)
   trackBehavior(userId, {
     eventType: "chat_query",
     metadata: { query: userMessage, intent },
   }).catch(() => {}); // fire and forget
+
+  trackInteraction({
+    userId,
+    eventType: "chat_query",
+    metadata: { query: userMessage, intent, sessionId: session.id },
+  });
 
   // Build messages array for AI
   const messages: AIMessage[] = buildMessages(
@@ -248,6 +255,28 @@ export async function sendMessage(
 
     const orchestratorResult = await buildItinerary(itineraryRequest);
     venues = orchestratorResult.venues;
+
+    // Track confetti creation + all venues shown in the itinerary
+    trackInteraction({
+      userId,
+      eventType: "confetti_create",
+      metadata: {
+        occasion: session.context.occasion,
+        theme: orchestratorResult.theme,
+        score: orchestratorResult.score,
+        venueCount: venues?.length ?? 0,
+      },
+    });
+    if (venues) {
+      for (const v of venues) {
+        trackInteraction({
+          userId,
+          eventType: "venue_view",
+          venueId: v.id,
+          metadata: { source: "confetti_plan", theme: orchestratorResult.theme },
+        });
+      }
+    }
 
     const aiResponse: AIResponse = {
       content: orchestratorResult.success
@@ -303,6 +332,17 @@ export async function sendMessage(
     venues = await searchVenuesForChat(userMessage, session.context, userContext);
     if (venues && venues.length > 0) {
       session.context.discoveredVenues = venues;
+
+      // Track that user was shown these venues (implicit signal for learning)
+      for (const v of venues) {
+        trackInteraction({
+          userId,
+          eventType: "venue_view",
+          venueId: v.id,
+          metadata: { source: "chat_recommendation", intent, query: userMessage },
+        });
+      }
+
       // Add venue context to the AI messages
       const venueContext = formatVenueContext(venues);
       messages.push({
